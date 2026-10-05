@@ -2,12 +2,14 @@
 
 ## Project summary
 
-Internal service health check for the DBCA **Spatial Support System (SSS)**. The application has two main components:
+Internal service health check for the DBCA **Spatial Support System (SSS)**. The project has two runtime layers:
 
-1. **`status.py`** — A standalone [Quart](https://quart.palletsprojects.com/) async web application that queries a set of external HTTP endpoints (Resource Tracking, KMI, KB, CSW, BFRS, Auth2, SSS) and exposes the results via several routes (`/json`, `/prtg`, `/legacy`, `/`, `/api/*`).
-2. **`healthcheck/`** — A supporting package that provides a background polling server (`healthcheckserver.py`), a socket-based IPC layer, configurable check types, and the Quart app extension (`healthcheckapp.py`) that imports `status.app`.
+1. **`status.py`** — A legacy standalone [Quart](https://quart.palletsprojects.com/) app kept for backward compatibility with older routes and external consumers (`/json`, `/prtg`, `/legacy`, `/`, `/api/*`). It still queries external HTTP endpoints, but it is not the preferred place for new UI work.
+2. **`healthcheck/`** — The supported health-check application package. It includes the background polling server (`healthcheckserver.py`), the socket IPC layer, configurable check types, and the Quart app extension (`healthcheckapp.py`) that hosts the current dashboard and health-check views.
 
 The project is deployed as a Docker container (Python 3.13 / Alpine) behind a Kubernetes ingress that enforces SSO authentication on protected routes.
+
+> **Legacy status view policy:** Views in `status.py` are considered legacy and will be removed later. Do not add new user-facing views, routes, or HTML/UI features there. Keep changes to `status.py` limited to compatibility fixes, required downstream integration, or necessary bug fixes while the old app remains in service.
 
 ---
 
@@ -39,8 +41,8 @@ Environment variables are loaded from a `.env` file via **python-dotenv**. Requi
 
 ```
 healthcheck/
-├── status.py                  # Standalone Quart app — primary healthcheck routes
-├── test_status.py             # pytest tests for status.py
+├── status.py                  # Legacy Quart compatibility app; no new views should be added here
+├── test_status.py             # pytest tests for status.py compatibility behaviour
 ├── prtg_schema.json           # JSON Schema for the /prtg endpoint response format
 ├── pyproject.toml             # Project metadata, dependencies (uv), ruff config
 ├── uv.lock                    # Locked dependency versions — commit this file
@@ -52,10 +54,10 @@ healthcheck/
 ├── templates/                 # Jinja2 templates (index.html etc.)
 ├── data_dir/                  # Runtime data directory for the polling server
 ├── kustomize/                 # Kubernetes manifests (base + overlays)
-└── healthcheck/               # Supporting package
+└── healthcheck/               # Supported package for health-check UI and polling logic
     ├── settings.py            # All environment-variable-driven configuration
     ├── healthcheck.py         # Core healthcheck logic and state
-    ├── healthcheckapp.py      # Quart app extension — imports status.app, adds routes
+    ├── healthcheckapp.py      # Active Quart app extension for the supported dashboard/views
     ├── healthcheckserver.py   # Background polling server (runs on port 9080)
     ├── healthcheckclient.py   # Client that connects to the polling server
     ├── checks/                # Pluggable check types (httpstatus, jsonresponse, etc.)
@@ -99,20 +101,23 @@ healthcheck/
 - Mock external HTTP calls with `unittest.mock.AsyncMock` and the `make_mock_client()` helper defined in the test file. Patch `status.get_session`, `status.get_anonymous_session`, `status.get_healthcheck`, `status.get_kb_layer`, or `status.get_kmi_layer` as appropriate.
 - Add tests for any new route or helper function.
 
-### Routes in `status.py`
+### Routes and legacy views in `status.py`
 
 - `/readyz` and `/livez` — public Kubernetes probes, no auth.
-- `/`, `/json`, `/legacy`, `/prtg`, `/api/*` — protected at the ingress level by external SSO; no auth code inside the app itself.
-- The `/prtg` endpoint returns JSON matching `prtg_schema.json` (`{"prtg": {"result": [...channels], "text": "...", "error": 0|1}}`).
+- `/`, `/json`, `/legacy`, `/prtg`, `/api/*` — legacy compatibility endpoints retained for older consumers; protected at the ingress level by external SSO; no auth code inside the app itself.
+- `/prtg` remains in place for downstream monitoring compatibility and returns JSON matching `prtg_schema.json` (`{"prtg": {"result": [...channels], "text": "...", "error": 0|1}}`).
 - All aggregate routes call `get_healthcheck()` and transform the result; avoid duplicating HTTP calls.
 - Cache-control headers (`max-age=60`) are applied when `CACHE_RESPONSE` is truthy.
+- New UI work belongs in `healthcheck/healthcheckapp.py` and the supporting templates/views, not in `status.py`. Treat `status.py` as a compatibility layer that may be removed later.
+- Keep changes in `status.py` minimal and backwards-compatible. Do not add new view handlers, dashboard HTML, or user-facing pages there unless a compatibility requirement explicitly demands it.
 
 ### Adding new checked sources
 
-1. Add the URL constant near the top of `status.py`.
+1. If a legacy `status.py` compatibility path must be updated, add the URL constant near the top of `status.py` only when required for backward compatibility.
 2. Add the fetch/check logic inside `get_healthcheck()`, populating keys on the `d` dict.
-3. Add a corresponding channel in `build_prtg_channels()`.
+3. Add a corresponding channel in `build_prtg_channels()` when the legacy `/prtg` output must continue to expose the metric.
 4. Update `SAMPLE_HEALTHCHECK` in `test_status.py` and add test coverage.
+5. Prefer adding new health-check logic and new features to the supported `healthcheck/` package rather than expanding the legacy `status.py` surface.
 
 ### Docker and deployment
 
