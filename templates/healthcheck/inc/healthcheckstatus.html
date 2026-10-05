@@ -1,14 +1,20 @@
 <script type="text/javascript">
+{% if debug %}
+let debug = true
+{% else %}
+let debug = false
+{% endif %}
 let healthstatus={}
 {% for section in healthcheck.healthchecksections %}
 healthstatus['{{section.sectionid}}'] = {}
     {% for service in section.healthcheckservices %}
         {% if service.healthstatus %}
-healthstatus['{{section.sectionid}}']['{{service.serviceid}}'] = {"timeout":{{service.timeout}},"checkstart":"{{service.healthstatus[1][0]}}","nextcheck": new Date("{{service.healthstatus[0]}}"),"message":`Health Status : {{service.healthstatus_name}}
-Check Start Time : {{service.healthstatus_checkstart}} 
-Check End Time : {{service.healthstatus_checkend}}
-Health Status Message : {{service.healthstatus_info}}
-Next Check Time : {{service.healthstatus_nextcheck}}
+healthstatus['{{section.sectionid}}']['{{service.serviceid}}'] = {"timeout":{{service.timeout}},"checkstart":"{{service.healthstatus[1][0]}}","nextcheck": new Date("{{service.healthstatus[0]}}"),"message":`
+       Health Status : {{service.healthstatus_name}}
+    Check Start Time : {{service.healthstatus_checkstart}} 
+      Check End Time : {{service.healthstatus_checkend}}
+Health Check Message : {{service.healthstatus_info}}
+     Next Check Time : {{service.healthstatus_nextcheck}}
 `}
         {% else %}
 healthstatus['{{section.sectionid}}']['{{service.serviceid}}'] = {"timeout":{{service.timeout}},"checkstart":"","nextcheck": null,"message":`Health Status : N/A
@@ -21,18 +27,24 @@ Next Check Time : N/A
     {% endfor %}
 {% endfor %}
 
-let controller = null;
+let controller = null
 let connect_msg = "initial connecting..."
 let connect_times = 0
 let lasttime2receivedata = new Date()
 let heartbeat_timeouts = 0
 let running = true
+let fetching = false
 const nextcheck_timeout_delay = {{nextcheck_timeout_delay}}
 const statuslist = ["green","yellow","red","error"]
 
 window.addEventListener('beforeunload', (event) => {
     running = false
 });
+
+function format_date(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2,'0') + "-" + String(d.getDate()).padStart(2,'0') + "T" + String(d.getHours()).padStart(2,'0') + ":" + String(d.getMinutes()).padStart(2,'0') + ":" + String(d.getSeconds()).padStart(2,'0')
+
+}
 
 function browserside_check() {
     let now = new Date()
@@ -44,6 +56,7 @@ function browserside_check() {
         }
         return 
     }
+    const nowstr = format_date(now)
     Object.entries(healthstatus).forEach(([section, sectionstatus]) => {
         Object.entries(sectionstatus).forEach(([service,servicestatus]) => {
             if (!servicestatus["nextcheck"]) {
@@ -67,20 +80,47 @@ function browserside_check() {
                 });
                 
                 const nextcheck = servicestatus["nextcheck"]
-                const nextcheckstr = nextcheck.getFullYear() + '-' + (nextcheck.getMonth() + 1) + "-" + nextcheck.getDate() + "T" + nextcheck.getHours() + ":" + nextcheck.getMinutes() + ":" + nextcheck.getSeconds()
+                const nextcheckstr = format_date(nextcheck)
                 if (connect_msg) {
-                    healthstatus[section][service]["message"] = `Health Status : error 
-    Health Status Message : ` + connect_msg + `
-    Next Check Time:` + nextcheckstr + `
+                    if (debug) {
+                        healthstatus[section][service]["message"] = `
+           Health Status : error 
+    Health Check Message : ` + connect_msg + `
+         Next Check Time : ` + nextcheckstr + `
+        Check Start Time : ` + healthstatus[section][service]["checkstart"] + `
+          Check End Time : ` + healthstatus[section][service]["checkend"] + `
+         Check Send Time : ` + healthstatus[section][service]["sendtime"] + `
+      Check Receive Time : ` + healthstatus[section][service]["receivetime"] + `
+               Scan Time : ` + nowstr + `
     `
+                    } else {
+                        healthstatus[section][service]["message"] = `
+           Health Status : error 
+    Health Check Message : ` + connect_msg + `
+         Next Check Time : ` + nextcheckstr + `
+    `
+                    }
                     if (document.getElementById(section+ "-" + service + "-details")) {
                         document.getElementById(section+ "-" + service + "-details").style.display="none"
                     }
-                } else {
-                    healthstatus[section][service]["message"] = `Health Status : error 
-    Health Status Message : Next Health check should be executed ` + Math.floor((now - servicestatus["nextcheck"]) / 1000) + ` seconds ago.
-    Next Check Time:` + nextcheckstr + `
+                } else if (debug) {
+                    healthstatus[section][service]["message"] = `
+           Health Status : error 
+    Health Check Message : Next Health check should be executed ` + Math.floor((now - servicestatus["nextcheck"]) / 1000) + ` seconds ago.
+         Next Check Time : ` + nextcheckstr + `
+        Check Start Time : ` + healthstatus[section][service]["checkstart"] + `
+          Check End Time : ` + healthstatus[section][service]["checkend"] + `
+         Check Send Time : ` + healthstatus[section][service]["sendtime"] + `
+      Check Receive Time : ` + healthstatus[section][service]["receivetime"] + `
+               Scan Time : ` + nowstr + `
     `
+                } else {
+                    healthstatus[section][service]["message"] = `
+           Health Status : error 
+    Health Check Message : Next Health check should be executed ` + Math.floor((now - servicestatus["nextcheck"]) / 1000) + ` seconds ago.
+         Next Check Time : ` + nextcheckstr + `
+    `
+
                 }
             }
         });
@@ -117,12 +157,26 @@ if (typeof continuouscheck_stopped === "function") {
     }
 }
 
+function showCustomAlert(section,service,msg) {
+    if (section) {
+        document.getElementById('alerttitle').textContent = section + ':' + service;
+    } else {
+        document.getElementById('alerttitle').textContent = service;
+    }
+    document.getElementById('alertbody').textContent = msg;
+    document.getElementById('alertdialog').style.display = 'flex';
+}
+
+function closeCustomAlert() {
+  document.getElementById('alertdialog').style.display = 'none';
+}
+
 
 async function fetch_healthstatus() {
-    controller = new AbortController();
+    fetching = true
     connect_times += 1
-
     try {
+        controller = new AbortController();
         const response = await fetch("{{statusstreamurl}}",{redirect:"manual",signal: controller.signal})
         const decoderStream = new TextDecoderStream();
         if (response.type == "opaqueredirect") {
@@ -134,7 +188,12 @@ async function fetch_healthstatus() {
         const reader = resbody.getReader();
         let remaindata = ""
         let datas = null
-        while (true) {
+        let now = null
+        let nowstr = null
+        let checkstart = null
+        let nextcheck = null
+        let nextcheckstr = null
+        while (running) {
             const { done, value } = await reader.read();
             lasttime2receivedata = new Date()
             if (done) {
@@ -142,6 +201,14 @@ async function fetch_healthstatus() {
             }
             if (value === null){
                 //continue to read data from stream
+                continue
+            }
+            if (debug) {
+                now = new Date()
+                nowstr = format_date(now)
+            }
+            if (value === "\n") {
+                //heartbeat
                 continue
             }
             datas = value.split("\n")
@@ -174,12 +241,13 @@ async function fetch_healthstatus() {
                     if (datas[i][0][0] == "Healthcheck" && datas[i][0][1] == "Healthcheck-Heartbeat") {
                         heartbeat_timeouts = 0
                     }
-                    const checkstart = datas[i][1][1][0]
+                    checkstart = datas[i][1][1][0]
                     if (healthstatus[datas[i][0][0]][datas[i][0][1]]["checkstart"] == checkstart) {
                         //the status was already processed before
                         continue
                     }
                     healthstatus[datas[i][0][0]][datas[i][0][1]]["checkstart"] = checkstart
+                    healthstatus[datas[i][0][0]][datas[i][0][1]]["checkend"] = datas[i][1][1][1]
                     statuslist.forEach((status) => {
                         if (status == datas[i][1][1][2]) {
                             document.getElementById(datas[i][0][0]+ "-" + datas[i][0][1] + "-statusname-" + status).style.display="inline"
@@ -187,16 +255,32 @@ async function fetch_healthstatus() {
                             document.getElementById(datas[i][0][0]+ "-" + datas[i][0][1] + "-statusname-" + status).style.display="none"
                         }
                     });
-                    const nextcheck = new Date(datas[i][1][0])
+                    nextcheck = new Date(datas[i][1][0])
                     healthstatus[datas[i][0][0]][datas[i][0][1]]["nextcheck"] = nextcheck
         
-                    const nextcheckstr = nextcheck.getFullYear() + '-' + (nextcheck.getMonth() + 1) + "-" + nextcheck.getDate() + "T" + nextcheck.getHours() + ":" + nextcheck.getMinutes() + ":" + nextcheck.getSeconds()
-                    healthstatus[datas[i][0][0]][datas[i][0][1]]["message"] = "Health Status : " + datas[i][1][1][2] + `
-Check Start Time : ` + datas[i][1][1][0] + `
-Check End Time : ` + datas[i][1][1][1] + `
-Health Status Message : ` + datas[i][1][1][3] + `
-Next Check Time : `  + nextcheckstr + `
-            `
+                    nextcheckstr = format_date(nextcheck)
+                    if (debug){ 
+                        healthstatus[datas[i][0][0]][datas[i][0][1]]["sendtime"] = datas[i][2]
+                        healthstatus[datas[i][0][0]][datas[i][0][1]]["receivetime"] = nowstr
+
+                        healthstatus[datas[i][0][0]][datas[i][0][1]]["message"] = `    
+       Health Status : ` + datas[i][1][1][2] + `
+    Check Start Time : ` + datas[i][1][1][0] + `
+      Check End Time : ` + datas[i][1][1][1] + `
+     Check Send Time : `  + datas[i][2] + `
+  Check Receive Time : `  + nowstr + `
+Health Check Message : ` + datas[i][1][1][3] + `
+     Next Check Time : `  + nextcheckstr + ` 
+`
+                    } else {
+                        healthstatus[datas[i][0][0]][datas[i][0][1]]["message"] = `
+       Health Status : ` + datas[i][1][1][2] + `
+    Check Start Time : ` + datas[i][1][1][0] + `
+      Check End Time : ` + datas[i][1][1][1] + `
+Health Check Message : ` + datas[i][1][1][3] + `
+     Next Check Time : `  + nextcheckstr + ` 
+`
+                    }
                     if (datas[i][1][1][4]) {
                         document.getElementById(datas[i][0][0]+ "-" + datas[i][0][1] + "-details").style.display="inline";
                         document.getElementById(datas[i][0][0]+ "-" + datas[i][0][1] + "-details-link").href= "{{baseurl}}/details/"+ datas[i][0][0] + "/" +  datas[i][0][1] + "/" + datas[i][1][1][0]
@@ -216,6 +300,7 @@ Next Check Time : `  + nextcheckstr + `
                 throw new Error("Failed to sync services' healthcheck data, reconnect to healthcheck service.")
             }
         }
+        throw new Error("Stop fetching the healthcheck status.")
     } catch (error) { 
         if (controller !== null) {
             controller.abort()
@@ -224,6 +309,8 @@ Next Check Time : `  + nextcheckstr + `
             connect_msg = "Connect times(" + connect_times + ") : Can't read healthdata from web server, try again 5 seconds later: " + error
             console.error(connect_msg)
             setTimeout(fetch_healthstatus,5000)
+        } else {
+            fetching = false
         }
     }
 }
@@ -264,7 +351,7 @@ fetch_healthstatus()
               {% endif %}
         </div>
         <div class="healthstatusbuttons">
-            <A href="javascript:alert(healthstatus['{{section.sectionid}}']['{{service.serviceid}}']['message'])"><img src="/static/img/info.svg" class="imgbutton"/></A> 
+            <A href="javascript:showCustomAlert(`{{section.name}}`,`{{service.name}}`,healthstatus['{{section.sectionid}}']['{{service.serviceid}}']['message'])"><img src="/static/img/info.svg" class="imgbutton"/></A> 
             {% if service.healthstatus_persistent %}
             <span id="{{section.sectionid}}-{{service.serviceid}}-details">
             {% else %}
@@ -295,4 +382,14 @@ fetch_healthstatus()
 {% endif %}
 {% endfor %}
 </table>
+
+<!-- Custom Alert Backdrop & Box -->
+<div id="alertdialog" >
+  <div id="alertcontainer">
+    <h3 id="alerttitle"></h3>
+    <p id="alertbody"></p>
+    <button onclick="closeCustomAlert()">OK</button>
+  </div>
+</div>
+
 

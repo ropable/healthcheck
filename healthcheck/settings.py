@@ -19,9 +19,19 @@ try:
 except:
     HEARTBEAT = 10
 
-HEALTHCHECKSERVICE_TIMEOUT = int(os.environ.get("HEALTHCHECKSERVICE_TIMEOUT",5000)) #milliseconds
+try:
+    STATUSSTREAM_HEARTBEAT = int(os.environ.get("STATUSSTREAM_HEARTBEAT"),8)
+    if STATUSSTREAM_HEARTBEAT < 0 :
+        STATUSSTREAM_HEARTBEAT = 8
+except:
+    STATUSSTREAM_HEARTBEAT = 8
 
-NEXTCHECK_TIMEOUT_DELAY = int(os.environ.get("NEXTCHECK_TIMEOUT_DELAY",1)) #configured in milliseconds
+HEALTHCHECKSERVICE_TIMEOUT = int(os.environ.get("HEALTHCHECKSERVICE_TIMEOUT",5000)) #milliseconds
+CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT",2000)) #milliseconds
+HEALTHCHECKSERVICE_RETRY = int(os.environ.get("HEALTHCHECKSERVICE_RETRY",3)) #retry times
+HEALTHCHECKSERVICE_RETRY_INTERVAL = int(os.environ.get("HEALTHCHECKSERVICE_RETRY_INTERVAL",100)) / 1000.0#retry interval, configured as milliseconds, but convert it into seconds
+
+NEXTCHECK_TIMEOUT_DELAY = int(os.environ.get("NEXTCHECK_TIMEOUT_DELAY",500)) #configured in milliseconds
 NEXTCHECK_CHECKINTERVAL = int(os.environ.get("NEXTCHECK_CHECKINTERVAL",10)) * 1000 #configured in seconds, tranform it to milliseconds
 
 BLOCK_TIMEOUT = int(os.environ.get("BLOCK_TIMEOUT",5)) # in seconds, 

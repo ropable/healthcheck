@@ -31,6 +31,33 @@ logger = logging.getLogger("healthcheck.healthcheck")
 #urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 PRTGDATA_NOT_ENABLED = "Disabled"
 
+RESERVED_PRTG_CHANNELS = {
+    "__status__": {
+        "unit": "Custom",
+        "customunit": "status",
+        "float": 1,
+        "value": 0
+    }
+    ,
+    "__processtime__": {
+        "unit": "Custom",
+        "customunit": "processtime",
+        "float": 1,
+        "value": 0
+    },
+    "__attempts__": {
+        "unit": "Custom",
+        "customunit": "count",
+        "float": 1,
+        "value": 0
+    }
+}
+RESERVED_PRTG_CHANNELNAME = {
+    "__status__": lambda service:"{} Status".format(service["name"]),
+    "__processtime__": lambda service: "{} Processtime".format(service["name"]),
+    "__attempts__": lambda service: "{} Attempts".format(service["name"])
+}
+
 class BaseServiceHealthCheckTask(object):
     def __init__(self,servicehealthcheck):
         self.servicehealthcheck = servicehealthcheck
@@ -49,57 +76,79 @@ class BaseServiceHealthCheckTask(object):
         pass
 
     async def run(self):
-        starttime = utils.now()
+        attempts = 0
         endtime = None
+        processtime = 0
         res = None
-        if self.servicehealthcheck.url:
-            try:
+        healthstatus = None
+        nextchecktime = self.servicehealthcheck.healthstatus_nextchecktime
+        while not healthstatus:
+            attempts += 1
+            starttime = utils.now()
+            if self.servicehealthcheck.url:
                 try:
-                    res = None
-                    data = None
-                    #logger.debug("{} : Start to run the healthcheck task({})".format(self.servicehealthcheck,self.__class__.__name__))
-                    async with httpx.AsyncClient(auth=self.servicehealthcheck.auth,timeout=self.servicehealthcheck.request_timeout,verify=self.servicehealthcheck.sslverify,headers=self.servicehealthcheck.headers) as client:
-                        if self.servicehealthcheck.method == "GET":
-                            func = client.get
-                        elif self.servicehealthcheck.method == "POST":
-                            func = client.post
-                            data = self.servicehealthcheck.formdata
-                        elif self.servicehealthcheck.method == "PUT":
-                            func = client.put
-                            data = self.servicehealthcheck.formdata
-                        elif self.servicehealthcheck.method == "DELETE":
-                            func = client.delete
-                        else:
-                            #Not support
-                            raise Exception("Http method({}) Not Support".format(self.method))
-                        if data:
-                            res = await func(self.servicehealthcheck.url,data=data)
-                        else:
-                            res = await func(self.servicehealthcheck.url)
-                finally:
-                    endtime = utils.now()
-    
-                healthstatus = HealthCheck.check_response(self.servicehealthcheck,res)
-            except httpx.TimeoutException as ex:
-                healthstatus = ["red","httpx.{} : {}".format(ex.__class__.__name__,str(ex)),None]
-                if not endtime:
-                    endtime = utils.now()
-            except Exception as ex:
-                healthstatus = ["error","{} : {}".format(ex.__class__.__name__,str(ex)),None]
-                if not endtime:
-                    endtime = utils.now()
-        else:
-            healthstatus = ["green","OK",None]
-            endtime = utils.now()
+                    try:
+                        res = None
+                        data = None
+                        #logger.debug("{} : Start to run the healthcheck task({})".format(self.servicehealthcheck,self.__class__.__name__))
+                        async with httpx.AsyncClient(auth=self.servicehealthcheck.auth,timeout=self.servicehealthcheck.request_timeout,verify=self.servicehealthcheck.sslverify,headers=self.servicehealthcheck.headers) as client:
+                            if self.servicehealthcheck.method == "GET":
+                                func = client.get
+                            elif self.servicehealthcheck.method == "POST":
+                                func = client.post
+                                data = self.servicehealthcheck.formdata
+                            elif self.servicehealthcheck.method == "PUT":
+                                func = client.put
+                                data = self.servicehealthcheck.formdata
+                            elif self.servicehealthcheck.method == "DELETE":
+                                func = client.delete
+                            else:
+                                #Not support
+                                raise Exception("Http method({}) Not Support".format(self.method))
+                            if data:
+                                res = await func(self.servicehealthcheck.url,data=data)
+                            else:
+                                res = await func(self.servicehealthcheck.url)
+                    finally:
+                        endtime = utils.now()
+                        processtime = (endtime - starttime).total_seconds() * 1000
+        
+                    healthstatus = HealthCheck.check_response(self.servicehealthcheck,res,attempts,processtime)
+                except (httpx.ConnectTimeout,httpx.NetworkError,httpx.ProxyError) as ex:
+                    if attempts >= self.servicehealthcheck.retry:
+                        healthstatus = HealthCheck.populate_healthstatus(self.servicehealthcheck,"red","httpx.{1}: {2}. Attempts={0}".format(attempts,ex.__class__.__name__,str(ex)),attempts,processtime)
+                    else:
+                        if self.servicehealthcheck.retry_interval:
+                            await asyncio.sleep(self.servicehealthcheck.retry_interval)
+                        continue
+                except (httpx.TimeoutException,httpx.StreamError) as ex:
+                    if attempts >= self.servicehealthcheck.retry:
+                        healthstatus = HealthCheck.populate_healthstatus(self.servicehealthcheck,"red","httpx.{1}: {2}. Attempts={0}".format(attempts,ex.__class__.__name__,str(ex)),attempts,processtime)
+                    elif nextchecktime and (nextchecktime - endtime).total_seconds() >= self.servicehealthcheck.total_retry_processtime:
+                        #still have time to try again
+                        if self.servicehealthcheck.retry_interval:
+                            await asyncio.sleep(self.servicehealthcheck.retry_interval)
+                        continue
+                    else:
+                        healthstatus = HealthCheck.populate_healthstatus(self.servicehealthcheck,"red","httpx.{1}: {2}. No time to try again. Attempts={0}".format(attempts,ex.__class__.__name__,str(ex)),attempts,processtime)
+                except Exception as ex:
+                    if ex.__class__.__module__ == "builtins":
+                        healthstatus = HealthCheck.populate_healthstatus(self.servicehealthcheck,"error","{1}: {2}. Attempts={0}".format(attempts,ex.__class__.__name__,str(ex)),attempts,processtime)
+                    else:
+                        healthstatus = HealthCheck.populate_healthstatus(self.servicehealthcheck,"error","{1}.{2}: {3}. Attempts={0}".format(attempts,ex.__class__.__module__,ex.__class__.__name__,str(ex)),attempts,processtime)
+            else:
+                healthstatus = ["green","OK",None]
+                endtime = utils.now()
 
         healthstatus.insert(0,starttime)
         healthstatus.insert(1,endtime)
         
         healthstatus.append(healthstatus[2] in self.servicehealthcheck.healthdetailpersistent)
         self.servicehealthcheck.healthstatus_healthdata = healthstatus
+        self.servicehealthcheck.healthstatus_running = False
 
         try:
-            await self.servicehealthcheck.save_checkingstatus(healthstatus,res)
+            await self.servicehealthcheck.save_checkingstatus(healthstatus,res,attempts)
         except Exception as ex:
             traceback.print_exc()
             logger.error("Failed to save the healthcheck status details({2}) of service({0}.{1}). {3}: {4}".format(self.servicehealthcheck.sectionid,self.servicehealthcheck.serviceid,healthstatus,ex.__class__.__name__,str(ex)))
@@ -158,6 +207,7 @@ class HealthCheckStatus(object):
 class HealthCheckPage(object):
     _last_greenhealthcheck = None
     _last_yellowhealthcheck = None
+    _last_greenyellowhealthcheck = None
     _last_redhealthcheck = None
     _last_errorhealthcheck = None
 
@@ -199,6 +249,12 @@ class HealthCheckPage(object):
         if self._size is None:
             self._load()
         return self._last_yellowhealthcheck
+
+    @property
+    def last_greenyellowhealthcheck(self):
+        if self._size is None:
+            self._load()
+        return self._last_greenyellowhealthcheck
 
     @property
     def last_redhealthcheck(self):
@@ -259,8 +315,10 @@ class HealthCheckPage(object):
                     self._last_healthcheck = HealthCheckStatus.deserialize(data)
                     if self._last_healthcheck[2] == "green":
                         self._last_greenhealthcheck = self._last_healthcheck
+                        self._last_greenyellowhealthcheck = self._last_healthcheck
                     elif self._last_healthcheck[2] == "yellow":
                         self._last_yellowhealthcheck = self._last_healthcheck
+                        self._last_greenyellowhealthcheck = self._last_healthcheck
                     elif self._last_healthcheck[2] == "red":
                         self._last_redhealthcheck = self._last_healthcheck
                     else:
@@ -647,6 +705,24 @@ class HealthCheckPages(BasicHealthCheckPages):
             return None
 
     @property
+    def last_greenyellowhealthcheck(self):
+        """
+        Called by healthcheck server
+        because _pages are loaded and catched in memory and only healthcheck server can change this file, no need to check whether the file was changed by other process after loading.
+        Return the last green or yellow healthcheck whichever is the latest one.
+        """
+        if self._pages is None:
+            self._load()
+        if self._pages:
+            for i in range(len(self._pages) - 1,-1,-1):
+                data = self._pages[i].last_greenyellowhealthcheck
+                if data:
+                    return data
+
+            return None
+        else:
+            return None
+    @property
     def last_redhealthcheck(self):
         """
         Called by healthcheck server
@@ -785,6 +861,17 @@ class ServiceHealthCheck(UserDict):
     def last_yellowhealthcheck(self,val):
         self._last_yellowhealthcheck = val
 
+    _last_greenyellowhealthcheck = "__NULL__"
+    @property
+    def last_greenyellowhealthcheck(self):
+        if self._last_greenyellowhealthcheck == "__NULL__": 
+            self._last_greenyellowhealthcheck = self.healthcheckpages.last_greenyellowhealthcheck
+        return self._last_greenyellowhealthcheck
+
+    @last_greenyellowhealthcheck.setter
+    def last_greenyellowhealthcheck(self,val):
+        self._last_greenyellowhealthcheck = val
+
     _last_redhealthcheck = "__NULL__"
     @property
     def last_redhealthcheck(self):
@@ -878,8 +965,20 @@ class ServiceHealthCheck(UserDict):
         return self["request_timeout"]
 
     @property
+    def total_retry_processtime(self):
+        return self["total_retry_processtime"]
+
+    @property
     def timeout(self):
         return self["timeout"]
+
+    @property
+    def retry(self):
+        return self["retry"]
+
+    @property
+    def retry_interval(self):
+        return self["retry_interval"]
 
     @property
     def sslverify(self):
@@ -899,13 +998,29 @@ class ServiceHealthCheck(UserDict):
     @property
     def healthstatus(self):
         """
-        return healthstatus [next checktime,[starttime,endtime,health status,health status message,prtg data,health checking persistent?]] 
+        server side: [next checktime,[starttime,endtime,health status,health status message,prtg data,health checking persistent?],running?] 
+        app side: [next checktime,[starttime,endtime,health status,health status message,prtg data,health checking persistent?]] 
         """
         return self.get("healthstatus")
 
     @healthstatus.setter
     def healthstatus(self,val):
         self["healthstatus"] = val
+
+    @property
+    def healthstatus_running(self):
+        """
+        Only available in server side
+        """
+        status = self.get("healthstatus")
+        return status[2] if status else False
+
+    @healthstatus_running.setter
+    def healthstatus_running(self,val):
+        """
+        Only available in server side
+        """
+        self["healthstatus"][2] = val
 
     @property
     def healthstatus_healthdata(self):
@@ -916,8 +1031,10 @@ class ServiceHealthCheck(UserDict):
     def healthstatus_healthdata(self,val):
         if val[2] == "green":
             self.last_greenhealthcheck = val
+            self.last_greenyellowhealthcheck = val
         elif val[2] == "yellow":
             self.last_yellowhealthcheck = val
+            self.last_greenyellowhealthcheck = val
         elif val[2] == "red":
             self.last_redhealthcheck = val
         else:
@@ -1037,7 +1154,7 @@ class ServiceHealthCheck(UserDict):
         else:
             return tomorrow + timedelta(seconds=checkingtime[0][0] + self.interval - (checkingtime[0][0] % self.interval) + offset)
 
-    async def save_checkingstatus(self,healthstatus,res):
+    async def save_checkingstatus(self,healthstatus,res,attempts):
         if healthstatus[-1]:
             details = {
                 "request": {
@@ -1049,6 +1166,8 @@ class ServiceHealthCheck(UserDict):
                 },
                 "healthstatus":healthstatus,
             }
+            if attempts > 1:
+                details["request"]["attempts"] = attempts
             if self.headers:
                 details["request"]["headers"] = self.headers
     
@@ -1087,7 +1206,7 @@ class ServiceHealthCheck(UserDict):
         last_healthcheck = self.healthcheckpages.last_healthcheck
 
         next_checktime = self.get_nextchecktime(self["offset"],last_healthcheck[0] if last_healthcheck else None)
-        self.healthstatus = [next_checktime,last_healthcheck] 
+        self.healthstatus = [next_checktime,last_healthcheck,False] 
 
 
 class JsonStatusMixin(object):
@@ -1244,10 +1363,11 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                         else:
                             service.healthstatus[0] = next_checktime
                 else:
-                    service.healthstatus = [next_checktime,None] 
+                    service.healthstatus = [next_checktime,None,False] 
                 if existing_service:
                     service._last_greenhealthcheck = existing_service._last_greenhealthcheck
                     service._last_yellowhealthcheck = existing_service._last_yellowhealthcheck
+                    service._last_greenyellowhealthcheck = existing_service._last_greenyellowhealthcheck
                     service._last_redhealthcheck = existing_service._last_redhealthcheck
                     service._last_errorhealthcheck = existing_service._last_errorhealthcheck
 
@@ -1391,7 +1511,7 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                     baseinterval = int(str(baseinterval).strip())
                     config["interval"] = baseinterval
             except Exception as ex:
-                errors.append("Section {}({}): The interval({}) is not an integer.".format(sectionindex,sectionid,config.get("interval")))
+                errors.append("Section {}({}): The proprety 'interval'({}) is not an integer.".format(sectionindex,sectionid,config.get("interval")))
                 continue
     
             try:
@@ -1402,8 +1522,34 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                     basetimeout = int(str(basetimeout).strip())
                 config["timeout"] = basetimeout
             except Exception as ex:
-                errors.append("Section {}({}): The timeout({}) is not an integer.".format(sectionindex,sectionid,config.get("timeout")))
+                errors.append("Section {}({}): The property 'timeout'({}) is not an integer.".format(sectionindex,sectionid,config.get("timeout")))
                 basetimeout = settings.HEALTHCHECKSERVICE_TIMEOUT
+                continue
+
+            try:
+                baseretry = config.get("retry")
+                if baseretry is None:
+                    baseretry = settings.HEALTHCHECKSERVICE_RETRY
+                elif not isinstance(baseretry,int):
+                    baseretry = int(str(baseretry).strip())
+                config["retry"] = baseretry
+            except Exception as ex:
+                errors.append("Section {}({}): The property 'retry'({}) is not an integer.".format(sectionindex,sectionid,config.get("retry")))
+                baseretry = settings.HEALTHCHECKSERVICE_RETRY
+                continue
+
+            try:
+                baseretryinterval = config.get("retry_interval")
+                if not baseretryinterval:
+                    baseretryinterval = settings.HEALTHCHECKSERVICE_RETRY_INTERVAL
+                elif not isinstance(baseretryinterval,int):
+                    baseretryinterval = int(str(baseretryinterval).strip()) / 1000
+                else:
+                    baseretryinterval = baseretryinterval / 1000
+                config["retryinterval"] = baseretryinterval
+            except Exception as ex:
+                errors.append("Section {}({}): The property 'retry_interval'({}) is not an integer.".format(sectionindex,sectionid,config.get("retry_interval")))
+                baseretryinterval = settings.HEALTHCHECKSERVICE_RETRY_INTERVAL
                 continue
 
             basemethod = config.get("method")
@@ -1492,7 +1638,7 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                 if baseprtgconfig:
                     failed = False
                     #initialize the prtg config
-                    #convert the list to map
+                    #convert list to map
                     configs = {}
                     for prtgconfig in baseprtgconfig:
                         prtgconfig["unit"] = prtgconfig.get("unit") or "Custom"
@@ -1539,6 +1685,16 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                         continue
 
                     baseprtgconfig = configs
+
+            #add the reserved prtg data to baseprtgconfig
+            if baseprtgconfig:
+                for k,v in RESERVED_PRTG_CHANNELS.items():
+                    if k in baseprtgconfig:
+                        #configured , ignore the RESERVED config
+                        continue
+                    baseprtgconfig[k] = v
+            else:
+                baseprtgconfig = RESERVED_PRTG_CHANNELS
 
             services = OrderedDict()
             serviceindex = 0
@@ -1680,8 +1836,34 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                     else:
                         service["interval"] = baseinterval
                 except Exception as ex:
-                    errors.append("Service {0}({1}).{2}({3}): The interval({4}) is not an integer".format(sectionindex,sectionid,serviceindex,serviceid,service.get("interval")))
+                    errors.append("Service {0}({1}).{2}({3}): The property 'interval'({4}) is not an integer".format(sectionindex,sectionid,serviceindex,serviceid,service.get("interval")))
                     continue
+
+                try:
+                    retry = service.get("retry")
+                    if retry is None:
+                        retry = baseretry
+                    elif not isinstance(retry,int):
+                        retry = int(str(retry).strip())
+                except Exception as ex:
+                    errors.append("Service {0}({1}).{2}({3}): The property 'retry'({4}) is not an integer".format(sectionindex,sectionid,serviceindex,serviceid,service.get("retry")))
+                    retry = baseretry
+                    continue
+                service["retry"] = retry
+
+                try:
+                    retryinterval = service.get("retry_interval")
+                    if not retryinterval:
+                        retryinterval = baseretryinterval
+                    elif not isinstance(retryinterval,int):
+                        retryinterval = int(str(retryinterval).strip()) / 1000
+                    else:
+                        retryinterval = retryinterval / 1000
+                except Exception as ex:
+                    errors.append("Service {0}({1}).{2}({3}): The property 'retry_interval'({4}) is not an integer".format(sectionindex,sectionid,serviceindex,serviceid,service.get("retry_interval")))
+                    retryinterval = baseretryinterval
+                    continue
+                service["retry_interval"] = retryinterval
 
                 try:
                     timeout = service.get("timeout")
@@ -1690,11 +1872,12 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                     elif not isinstance(timeout,int):
                         timeout = int(str(timeout).strip())
                 except Exception as ex:
-                    errors.append("Service {0}({1}).{2}({3}): The timeout({4}) is not an integer".format(sectionindex,sectionid,serviceindex,serviceid,service.get("timeout")))
+                    errors.append("Service {0}({1}).{2}({3}): The property 'timeout'({4}) is not an integer".format(sectionindex,sectionid,serviceindex,serviceid,service.get("timeout")))
                     timeout = basetimeout
                     continue
                 service["timeout"] = timeout
-                service["request_timeout"] = timeout / 1000.0
+                service["total_retry_processtime"] = (settings.CONNECT_TIMEOUT + timeout) / 1000.0 + retryinterval
+                service["request_timeout"] = httpx.Timeout(connect = settings.CONNECT_TIMEOUT / 1000.0, read=timeout / 1000.0,write=timeout / 1000.0,pool=timeout/1000.0)
 
                 try:
                     historyexpire = service.get("historyexpire")
@@ -1756,6 +1939,11 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                 service = ServiceHealthCheck(self,service)
 
                 #merge the sector's prtg config into service's prtg config
+                reserved_prtg_channelids = set(RESERVED_PRTG_CHANNELS.keys())
+                reserved_prtg_channelnames = dict()
+                for k,func in RESERVED_PRTG_CHANNELNAME.items():
+                    reserved_prtg_channelnames[k] = func(service)
+
                 if service.get("prtg"):
                     if not isinstance(service["prtg"],list):
                         service["prtg"] = [service["prtg"]]
@@ -1794,6 +1982,7 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                         if failed:
                             break
 
+
                         #find the baseconfig
                         baseconfig = baseprtgconfig.get(prtgconfig["id"]) if baseprtgconfig else None
 
@@ -1808,10 +1997,10 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                 else:
                     service["prtg"] = None
 
+                prtgconfigmap = OrderedDict()
                 if service["prtg"]:
                     #initialize the final prtg config
                     #convert the prtg config from list to dict
-                    prtgconfigmap = OrderedDict()
                     for prtgconfig in service["prtg"]:
                         prtgconfig["channel"] = prtgconfig.get("channel") or service["name"]
                         prtgconfig["unit"] = prtgconfig.get("unit") or "Custom"
@@ -1833,7 +2022,7 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                         computed_columns = {}
                         for k,v in prtgconfig.items():
                             if callable(v):
-                                #turn the two arguments to one argument is required
+                                #turn the func with two arguments to a func with one argument if required
                                 computed_columns[k] = checks.lambda_func_fatctory(service,v)
 
                         for k in computed_columns.keys():
@@ -1841,7 +2030,19 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
 
                         prtgconfigmap[channelid] = (prtgconfig,getdata_map,computed_columns)
 
-                    service["prtg"] = prtgconfigmap
+                        #remove it from reserved prtg channel set to avoid to add this reserved prtg channel again.
+                        reserved_prtg_channelids.discard(channelid)
+                        if prtgconfig["channel"] in reserved_prtg_channelnames:
+                            #the default channel name used by reserved prtg channels is configured in service prtg data, ignore the related reserved prtd data
+                            reserved_prtg_channelids.discard(reserved_prtg_channelnames[prtgconfig["channel"]])
+
+                #Add the RESERVED PRTG DATA if still has some reserved prtg channels are not added.
+                for channelid in reserved_prtg_channelids:
+                    prtgconfig = dict(baseprtgconfig[channelid])
+                    prtgconfig["channel"] = RESERVED_PRTG_CHANNELNAME[channelid](service)
+                    prtgconfigmap[channelid] = (prtgconfig,{},{})
+
+                service["prtg"] = prtgconfigmap
 
 
                 if not service["healthchecks"]:
@@ -1940,7 +2141,7 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
 
     def _schedule_continuous_check(self,taskcls,*args):
         shutdown.unregister_scheduled_task(self._continuous_check_task)
-        asyncio.create_task(self._continuous_check(taskcls,*args))
+        self._continuous_check_task = asyncio.create_task(self._continuous_check(taskcls,*args))
 
     def stop_continuous_check(self):
         if not self._continuous_check_task:
@@ -1976,11 +2177,19 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                     continue
                 if now >= service.healthstatus_nextchecktime:
                     #check this service now
-                    logger.debug("{} : Run a task to check the service({}.{}.lastchecktime = {}, next checktime={})  to task runner.".format(self,service.sectionid,service.serviceid,service.healthstatus_nextcheck,service.get_nextchecktime(service["offset"],service.healthstatus_nextchecktime,now,today,tomorrow,seconds_in_day)))
-                    task = taskcls(service,*args)
-                    asyncio.create_task(task.run())
-                    next_checktime = service.get_nextchecktime(service["offset"],service.healthstatus_nextchecktime,now,today,tomorrow,seconds_in_day)
-                    service.healthstatus_nextchecktime = next_checktime
+                    if service.healthstatus_running:
+                        #the healthcheck of this service is running now
+                        #can't launch another healthcheck. delay 5 seconds and try again
+                        next_checktime = now + timedelta(seconds=5)
+                    else:
+                        #the healthcheck of this service is not running
+                        logger.debug("{} : Run a task to check the service({}.{}.lastchecktime = {}, next checktime={})  to task runner.".format(self,service.sectionid,service.serviceid,service.healthstatus_nextcheck,service.get_nextchecktime(service["offset"],service.healthstatus_nextchecktime,now,today,tomorrow,seconds_in_day)))
+                        service.healthstatus_running = True
+                        task = taskcls(service,*args)
+                        asyncio.create_task(task.run())
+                        next_checktime = service.get_nextchecktime(service["offset"],service.healthstatus_nextchecktime,now,today,tomorrow,seconds_in_day)
+                        #set the nextchecktime
+                        service.healthstatus_nextchecktime = next_checktime
                 else:
                     next_checktime = service.healthstatus_nextchecktime
                 if not self._next_runtime or self._next_runtime > next_checktime:
@@ -1996,7 +2205,7 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
         seconds = (self._next_runtime - utils.now()).total_seconds()
         if seconds > 0:
             logger.debug("Waiting {} seconds to begin the next batch of service health check.".format(seconds))
-            self._continous_check_task = asyncio.get_running_loop().call_later(seconds,self._schedule_continuous_check,taskcls,*args)
+            self._continuous_check_task = asyncio.get_running_loop().call_later(seconds,self._schedule_continuous_check,taskcls,*args)
             shutdown.register_scheduled_task(self._continuous_check_task)
         else:
             self._continuous_check_task = asyncio.create_task(self._continuous_check(taskcls,*args))
@@ -2017,7 +2226,26 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
 
 
     @classmethod
-    def check_response(cls,serviceconfig,res):
+    def populate_healthstatus(cls,serviceconfig,status,message,attempts,processtime):
+        """
+        Get the healthstatus for exception
+        """
+        if serviceconfig["prtg"]:
+            prtgdata = {}
+            for channelid in serviceconfig["prtg"].keys():
+                if channelid == "__status__":
+                    prtgdata[channelid] = 3 if status == "green" else (2 if status == "yellow" else (1 if status == "red" else 0))
+                elif channelid == "__processtime__":
+                    prtgdata[channelid] = int(processtime) #milliseconds
+                elif channelid == "__attempts__":
+                    prtgdata[channelid] = attempts
+        else:
+            prtgdata = PRTGDATA_NOT_ENABLED
+
+        return [status,message,prtgdata]
+
+    @classmethod
+    def check_response(cls,serviceconfig,res,attempts,processtime):
         """
         Return [traffic light, msgs,prtg data]
         """
@@ -2044,6 +2272,12 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                         for channelid in serviceconfig["prtg"].keys():
                             if get_prtgdata.get(channelid):
                                 prtgdata[channelid] = get_prtgdata[channelid](res)
+                            elif channelid == "__status__":
+                                prtgdata[channelid] = 3 if key == "green" else (2 if key == "yellow" else (1 if key == "red" else 0))
+                            elif channelid == "__processtime__":
+                                prtgdata[channelid] = int(processtime) #milliseconds
+                            elif channelid == "__attempts__":
+                                prtgdata[channelid] = attempts
                     else:
                         prtgdata = PRTGDATA_NOT_ENABLED
 
@@ -2067,7 +2301,7 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
 
             except Exception as ex:
                 traceback.print_exc()
-                healthstatus = ["error","Failed to check health status '{}'.{}:{}".format(key,ex.__class__.__name__,str(ex)),None]
+                healthstatus = cls.populate_healthstatus(serviceconfig,"error","Failed to check health status '{}'.{}:{}".format(key,ex.__class__.__name__,str(ex)),attempts,processtime)
                 break
     
         if not healthstatus:
@@ -2077,9 +2311,13 @@ class HealthCheck(PRTGMixin,JsonStatusMixin):
                     message = res.text
                 else:
                     message = "non-text response"
-                healthstatus = ["error","Status Code:{}, Message:{}".format(res.status_code,message),None]
+                healthstatus = cls.populate_healthstatus(serviceconfig,"error","Status Code:{}, Message:{}".format(res.status_code,message),attempts,processtime)
             else:
-                healthstatus = ["error","All healthstatus configured in {} are not satisfied.".format(serviceconfig),None]
+                healthstatus = cls.populate_healthstatus(serviceconfig,"error","All healthstatus configured in {} are not satisfied.",attempts,processtime)
+
+
+        if attempts > 1:
+            healthstatus[1] = "{1}. Attempts:{0}".format(attempts,healthstatus[1])
     
         return healthstatus
 

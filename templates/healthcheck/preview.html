@@ -23,6 +23,10 @@
             stop_browserside_check()
 
         }
+        window.onload = function() {
+            continuouscheck_started()
+        }
+
         {% include 'healthcheck/inc/healthcheck.js' %}
     </script>
   </head>

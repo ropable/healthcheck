@@ -70,7 +70,7 @@ class SocketClient(object):
                 try:
                     logger.debug("{}: Try to connect to socket server.".format(self))
 
-                    async with asyncio.timeout(1):
+                    async with asyncio.timeout(2):
                         reader,writer = await asyncio.open_connection(self.host,self.port) 
 
                     conn = base.BaseConnection(reader,writer)

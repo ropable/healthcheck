@@ -83,15 +83,15 @@ class HealthStatusSubscriptor(BaseHealthStatusSubscriptor):
     conn_type = socket.HEALTHSTATUS_SUBSCRIPTOR
 
     async def initialize(self):
-        await self.send([socket.HEALTHCONFIG_HAHSCODE,healthcheck.config_hashcode])
+        await self.send([socket.HEALTHCONFIG_HASHCODE,healthcheck.config_hashcode])
         for section in healthcheck.sections.values():
             for service in section["services"].values():
                 if service.get("healthstatus"):
                     await self.send([socket.INITIAL_HEALTHSTATUS,[[service.sectionid,service.serviceid],service["healthstatus"]]])
 
     @classmethod
-    async def healthconfig_changed(cls):
-        await cls._send_data([socket.HEALTHCONFIG_HAHSCODE,healthcheck.config_hashcode])
+    async def send_healthconfig_hashcode(cls):
+        await cls._send_data([socket.HEALTHCONFIG_HASHCODE,healthcheck.config_hashcode])
     
 
 class EditingHealthStatusSubscriptor(BaseHealthStatusSubscriptor):
@@ -100,7 +100,7 @@ class EditingHealthStatusSubscriptor(BaseHealthStatusSubscriptor):
     conn_type = socket.EDITING_HEALTHSTATUS_SUBSCRIPTOR
 
     async def initialize(self):
-        await self.send([socket.HEALTHCONFIG_HAHSCODE,healthcheck.editing_healthcheck.config_hashcode])
+        await self.send([socket.HEALTHCONFIG_HASHCODE,healthcheck.editing_healthcheck.config_hashcode])
         for section in healthcheck.editing_healthcheck.sections.values():
             for service in section["services"].values():
                 if service.get("healthstatus"):
@@ -112,8 +112,8 @@ class EditingHealthStatusSubscriptor(BaseHealthStatusSubscriptor):
             await self.continuouscheck_stopped()
 
     @classmethod
-    async def healthconfig_changed(cls):
-        await cls._send_data([socket.HEALTHCONFIG_HAHSCODE,healthcheck.editing_healthcheck.config_hashcode])
+    async def send_healthconfig_hashcode(cls):
+        await cls._send_data([socket.HEALTHCONFIG_HASHCODE,healthcheck.editing_healthcheck.config_hashcode])
     
 class ServiceHealthCheckTask(BaseServiceHealthCheckTask):
     def __init__(self,servicehealthcheck,socketserver):
@@ -137,7 +137,7 @@ class CommandConnection(socket.CommandConnection):
     SAVE_EDITING_HEALTHCHECK="save_editing_healthcheck"
     RELOAD_DASHBOARD="reload_dashboard"
     async def start_preview_healthcheck(self):
-        await EditingHealthStatusSubscriptor.healthconfig_changed()
+        await EditingHealthStatusSubscriptor.send_healthconfig_hashcode()
         if not healthcheck.editing_healthcheck.is_continuous_check_started:
             await healthcheck.editing_healthcheck.continuous_check(self.server,taskcls=EditingServiceHealthCheckTask)
             await EditingHealthStatusSubscriptor.continuouscheck_started()
@@ -153,7 +153,7 @@ class CommandConnection(socket.CommandConnection):
         changed = healthcheck.editing_healthcheck.reload()
         if changed and healthcheck.editing_healthcheck.is_continuous_check_started:
             healthcheck.editing_healthcheck.stop_continuous_check()  
-            await EditingHealthStatusSubscriptor.healthconfig_changed()
+            await EditingHealthStatusSubscriptor.send_healthconfig_hashcode()
             await healthcheck.editing_healthcheck.continuous_check(self.server,taskcls=EditingServiceHealthCheckTask)
         return [True,"OK"]
 
@@ -161,7 +161,7 @@ class CommandConnection(socket.CommandConnection):
         changed = healthcheck.reload()
         if changed and healthcheck.is_continuous_check_started:
             healthcheck.stop_continuous_check()  
-            await HealthStatusSubscriptor.healthconfig_changed()
+            await HealthStatusSubscriptor.send_healthconfig_hashcode()
             await healthcheck.continuous_check(self.server,taskcls=ServiceHealthCheckTask)
         return [True,"OK"]
 

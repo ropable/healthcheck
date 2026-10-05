@@ -217,6 +217,7 @@ async def delete_prtgsensor(sensorid):
 @app.route("/healthcheck/dashboard",defaults={'system': None})
 @app.route("/healthcheck/dashboard/<system>")
 async def dashboard(system):
+    debug = request.args.get("debug","false").lower() == "true"
     healthservice_nextcheck = utils.now() + timedelta(seconds=settings.HEARTBEAT + 1)
     healthservice_nextcheck = int(healthservice_nextcheck.timestamp()) * 1000
     user = request.headers.get("X-email")
@@ -228,13 +229,17 @@ async def dashboard(system):
         viewkey = user
         statusstreamurl = "/healthcheck/healthstatusstream"
 
+    if debug:
+        statusstreamurl = "{}?debug=true".format(statusstreamurl)
+
+
     if viewkey:
         healthcheckview = healthcheck.get_view(viewkey)
     else:
         healthcheckview = healthcheck
 
 
-    return await render_template("healthcheck/dashboard.html",healthcheck=healthcheckview,healthservice_nextcheck=healthservice_nextcheck,nextcheck_timeout_delay=settings.NEXTCHECK_TIMEOUT_DELAY,nextcheck_checkinterval=settings.NEXTCHECK_CHECKINTERVAL,baseurl="/healthcheck",statusstreamurl=statusstreamurl,adminable=adminable,heartbeat=settings.HEARTBEAT,user=user,system=system)
+    return await render_template("healthcheck/dashboard.html",healthcheck=healthcheckview,healthservice_nextcheck=healthservice_nextcheck,nextcheck_timeout_delay=settings.NEXTCHECK_TIMEOUT_DELAY,nextcheck_checkinterval=settings.NEXTCHECK_CHECKINTERVAL,baseurl="/healthcheck",statusstreamurl=statusstreamurl,adminable=adminable,heartbeat=settings.HEARTBEAT,user=user,system=system,debug=debug)
 
 @app.route("/healthcheck/reload")
 async def reload_dashboard():
@@ -244,39 +249,58 @@ async def reload_dashboard():
     except Exception as ex:
         return "Failed to reload the dashboard.{}".format(str(ex)), 500
 
-def dump_servicehealthstatus(sectionid,serviceid,healthstatus):
-    return '[[\"{}\",\"{}\"],[{},[{},{},\"{}\",{},{}]]]\n'.format(
-        sectionid,
-        serviceid,
-        healthstatus[0].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[0] else "null",
-        healthstatus[1][0].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[1] and healthstatus[1][0] else "null",
-        healthstatus[1][1].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[1] and healthstatus[1][1] else "null",
-        healthstatus[1][2] if healthstatus[1] else "" ,
-        json.dumps(healthstatus[1][3] if healthstatus[1] else ""),
-        "true" if healthstatus[1] and healthstatus[1][-1] else "false"
-    )
+def dump_servicehealthstatus(debug,sectionid,serviceid,healthstatus):
+    if debug:
+        return '[[\"{}\",\"{}\"],[{},[{},{},\"{}\",{},{}]],\"{}\"]\n'.format(
+            sectionid,
+            serviceid,
+            healthstatus[0].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[0] else "null",
+            healthstatus[1][0].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[1] and healthstatus[1][0] else "null",
+            healthstatus[1][1].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[1] and healthstatus[1][1] else "null",
+            healthstatus[1][2] if healthstatus[1] else "" ,
+            json.dumps(healthstatus[1][3] if healthstatus[1] else ""),
+            "true" if healthstatus[1] and healthstatus[1][-1] else "false",
+            datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
+        )
+    else:
+        return '[[\"{}\",\"{}\"],[{},[{},{},\"{}\",{},{}]]]\n'.format(
+            sectionid,
+            serviceid,
+            healthstatus[0].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[0] else "null",
+            healthstatus[1][0].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[1] and healthstatus[1][0] else "null",
+            healthstatus[1][1].strftime("\"%Y-%m-%dT%H:%M:%S.%f\"") if healthstatus[1] and healthstatus[1][1] else "null",
+            healthstatus[1][2] if healthstatus[1] else "" ,
+            json.dumps(healthstatus[1][3] if healthstatus[1] else ""),
+            "true" if healthstatus[1] and healthstatus[1][-1] else "false"
+        )
 
 @app.route("/healthcheck/healthstatusstream",defaults={'system': None})
 @app.route("/healthcheck/healthstatusstream/<system>")
 async def healthstatusstream(system):
     viewkey = system or request.headers.get("X-email")
     viewsettings = healthcheck.get_viewsettings(viewkey)
+    debug = request.args.get("debug","false").lower() == "true"
 
     @stream_with_context
     async def async_generator():
         for section in healthcheck.healthchecksections:
             for service in section.healthcheckservices:
                 if service.healthstatus:
-                    yield dump_servicehealthstatus(section.sectionid,service.serviceid,service.healthstatus).encode()
+                    yield dump_servicehealthstatus(debug,section.sectionid,service.serviceid,service.healthstatus).encode()
 
         reader = healthstatuslistener.get_healthstatusreader()
         while not shutdown.shutdowning:
-            await healthstatuslistener.wait()
+            await healthstatuslistener.wait(settings.STATUSSTREAM_HEARTBEAT)
+            sent_heartbeat = True
             for healthstatus in reader.items():
                 if isinstance(healthstatus,str):
                     yield "{}\n".format(json.dumps(healthstatus,cls=serializers.JSONFormater)).encode()
                 else:
-                    yield dump_servicehealthstatus(*healthstatus[0],healthstatus[1]).encode()
+                    yield dump_servicehealthstatus(debug,*healthstatus[0],healthstatus[1]).encode()
+                sent_heartbeat = False
+            if sent_heartbeat:
+                yield b"\n"
+
 
     @stream_with_context
     async def async_generator_view():
@@ -284,19 +308,35 @@ async def healthstatusstream(system):
             serviceset = viewsettings.get(section.sectionid,set())
             for service in section.healthcheckservices:
                 if service.healthstatus and service.serviceid in serviceset:
-                    yield dump_servicehealthstatus(section.sectionid,service.serviceid,service.healthstatus).encode()
+                    yield dump_servicehealthstatus(debug,section.sectionid,service.serviceid,service.healthstatus).encode()
 
         reader = healthstatuslistener.get_healthstatusreader()
         while not shutdown.shutdowning:
-            await healthstatuslistener.wait()
-            for healthstatus in reader.items():
-                if isinstance(healthstatus,str):
-                    yield "{}\n".format(json.dumps(healthstatus,cls=serializers.JSONFormater)).encode()
-                elif healthstatus[0][1] in viewsettings.get(healthstatus[0][0],set()):
-                    yield dump_servicehealthstatus(*healthstatus[0],healthstatus[1]).encode()
+            try:
+                async with asyncio.timeout(settings.STATUSSTREAM_HEARTBEAT):
+                    await healthstatuslistener.wait()
+                for healthstatus in reader.items():
+                    if isinstance(healthstatus,str):
+                        yield "{}\n".format(json.dumps(healthstatus,cls=serializers.JSONFormater)).encode()
+                    elif healthstatus[0][1] in viewsettings.get(healthstatus[0][0],set()):
+                        yield dump_servicehealthstatus(debug,*healthstatus[0],healthstatus[1]).encode()
+            except asyncio.TimeoutError as ex:
+                yield b"\n"
 
-    response = await make_response(async_generator_view() if viewsettings else async_generator())
+    response = await make_response(
+        async_generator_view() if viewsettings else async_generator(),
+        {
+            # The Cache-Control header need to be set thus to work behind Fastly caching.
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "private, no-store",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable response buffering in Nginx.
+            "x-content-type-options":"nosniff",
+            "x-frame-options": "DENY"
+        }
+    )
     response.timeout = None  # Prevents Quart from killing the connection
+
     return response
 
 @app.route("/healthcheck/customize",defaults={'system': None},methods=["GET","POST"])
@@ -581,6 +621,7 @@ async def rollback():
 
 @app.route("/healthcheck/config/preview",methods=["GET"])
 async def preview_editing_healthcheck():
+    debug = request.args.get("debug","false").lower() == "true"
     editable = await can_admin(request)
     if not editable:
         return "Not Authorized", 403
@@ -588,6 +629,7 @@ async def preview_editing_healthcheck():
     try:
         result = await commandclient.exec("start_preview_healthcheck",1)
         if result[0]:
+            editinghealthstatuslistener.continuouscheck_started = True
             msg = None
         else:
             msg = [result[1]]
@@ -595,9 +637,15 @@ async def preview_editing_healthcheck():
         traceback.print_exc()
         msg = [str(ex)]
 
+    if debug:
+        statusstreamurl = "/healthcheck/config/healthstatusstream?debug=true"
+    else:
+        statusstreamurl = "/healthcheck/config/healthstatusstream"
+
+
     healthservice_nextcheck = utils.now() + timedelta(seconds=settings.HEARTBEAT + 1)
     healthservice_nextcheck = int(healthservice_nextcheck.timestamp()) * 1000
-    return await render_template("healthcheck/preview.html",healthcheck=healthcheck.editing_healthcheck,messages=msg,healthservice_nextcheck=healthservice_nextcheck,nextcheck_timeout_delay=settings.NEXTCHECK_TIMEOUT_DELAY,nextcheck_checkinterval=settings.NEXTCHECK_CHECKINTERVAL,baseurl="/healthcheck/config",statusstreamurl="/healthcheck/config/healthstatusstream",heartbeat=settings.HEARTBEAT)
+    return await render_template("healthcheck/preview.html",healthcheck=healthcheck.editing_healthcheck,messages=msg,healthservice_nextcheck=healthservice_nextcheck,nextcheck_timeout_delay=settings.NEXTCHECK_TIMEOUT_DELAY,nextcheck_checkinterval=settings.NEXTCHECK_CHECKINTERVAL,baseurl="/healthcheck/config",statusstreamurl=statusstreamurl,heartbeat=settings.HEARTBEAT,debug=debug)
 
 @app.route("/healthcheck/config/history/<sectionid>/<serviceid>",defaults={'pageid': ""})
 @app.route("/healthcheck/config/history/<sectionid>/<serviceid>/<pageid>")
@@ -697,6 +745,7 @@ async def start_preview_editing_healthcheck():
     try:
         result = await commandclient.exec("start_preview_healthcheck",1)
         if result[0]:
+            editinghealthstatuslistener.continuouscheck_started = True
             msg = "OK"
         else:
             msg = result[1]
@@ -714,6 +763,7 @@ async def stop_preview_editing_healthcheck():
     try:
         result = await commandclient.exec("stop_preview_healthcheck",1)
         if result[0]:
+            editinghealthstatuslistener.continuouscheck_started = False
             msg = "OK"
         else:
             msg = result[1]
@@ -745,6 +795,7 @@ def prtg(sensorid):
 @app.route("/healthcheck/config/healthstatusstream")
 async def editinghealthstatusstream():
     editable = await can_admin(request)
+    debug = request.args.get("debug","false").lower() == "true"
     if not editable:
         return "Not Authorized", 403
 
@@ -752,24 +803,38 @@ async def editinghealthstatusstream():
     async def async_generator():
         for section in healthcheck.editing_healthcheck.healthchecksections:
             for service in section.healthcheckservices:
-                yield dump_servicehealthstatus(section.sectionid,service.serviceid,service.healthstatus).encode()
+                yield dump_servicehealthstatus(debug,section.sectionid,service.serviceid,service.healthstatus).encode()
 
         if editinghealthstatuslistener.continuouscheck_started:
             yield "{}\n".format(json.dumps("continuouscheck_started")).encode()
-        else:
+        elif editinghealthstatuslistener.continuouscheck_started == False:
             yield "{}\n".format(json.dumps("continuouscheck_stopped")).encode()
 
         reader = editinghealthstatuslistener.get_healthstatusreader()
         while not shutdown.shutdowning:
-            await editinghealthstatuslistener.wait()
-
+            await editinghealthstatuslistener.wait(settings.STATUSSTREAM_HEARTBEAT)
+            sent_heartbeat = True
             for healthstatus in reader.items():
                 if isinstance(healthstatus,str):
                     yield "{}\n".format(json.dumps(healthstatus,cls=serializers.JSONFormater)).encode()
                 else:
-                    yield dump_servicehealthstatus(*healthstatus[0],healthstatus[1]).encode()
+                    yield dump_servicehealthstatus(debug,*healthstatus[0],healthstatus[1]).encode()
+                sent_heartbeat = False
+            if sent_heartbeat:
+                yield b"\n"
 
-    response = await make_response(async_generator())
+    response = await make_response(
+        async_generator(),
+        {
+            # The Cache-Control header need to be set thus to work behind Fastly caching.
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "private, no-store",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable response buffering in Nginx.
+            "x-content-type-options":"nosniff",
+            "x-frame-options": "DENY"
+        }
+    )
     response.timeout = None  # Prevents Quart from killing the connection
     return response
 

@@ -19,11 +19,24 @@ function clear_messages(messages) {
 }
 async function start_preview(){
     try {
+        document.getElementById("runningstatus").innerHTML="Waiting..."
+        document.getElementById("button_start").disabled = true
+        document.getElementById("button_stop").disabled = true
         const response = await fetch("/healthcheck/config/preview/start")
         body = await response.text()
         if (!response.ok) {
+            document.getElementById("runningstatus").innerHTML="Stopped..."
+            document.getElementById("button_start").disabled = false
             throw new Error(response.status + " : " + body);
+        } else {
+            running = true
+            document.getElementById("runningstatus").innerHTML="Running..."
+            document.getElementById("button_stop").disabled = false
+            if (!fetching) {
+                fetch_healthstatus()
+            }
         }
+
         clear_messages()
         return body
     } catch(error) {
@@ -34,10 +47,22 @@ async function start_preview(){
 
 async function stop_preview(){
     try {
+        document.getElementById("runningstatus").innerHTML="Waiting..."
+        document.getElementById("button_start").disabled = true
+        document.getElementById("button_stop").disabled = true
         const response = await fetch("/healthcheck/config/preview/stop")
         body = await response.text()
         if (!response.ok) {
+            document.getElementById("runningstatus").innerHTML="Running..."
+            document.getElementById("button_stop").disabled = false
             throw new Error(response.status + " : " + body);
+        } else {
+            if (controller !== null) {
+                controller.abort()
+            }
+            document.getElementById("runningstatus").innerHTML="Stopped..."
+            document.getElementById("button_start").disabled = false
+            running = false
         }
         return body
     } catch(error) {
